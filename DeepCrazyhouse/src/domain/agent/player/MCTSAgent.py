@@ -4,14 +4,23 @@ Created on 10.10.18
 @project: crazy_ara_refactor
 @author: queensgambit
 
-Please describe what the content of this file is about
+The MCTSAgent runs playouts/simulations in the search tree and updates the node statistics.
+The final move is chosen according to the visit count of each direct child node.
+One playout is defined as expanding one new node in the tree. In the case of chess this means evaluating a new board position.
+
+If the evaluation for one move takes too long on your hardware you can decrease the value for:
+ nb_playouts_empty_pockets and nb_playouts_filled_pockets.
+
+For more details and the mathematical equations please take a look at src/domain/agent/README.md as well as the
+official DeepMind-papers.
 """
 
 import numpy as np
+
 from DeepCrazyhouse.src.domain.crazyhouse.output_representation import get_probs_of_move_list, value_to_centipawn
 from DeepCrazyhouse.src.domain.agent.NeuralNetAPI import NeuralNetAPI
 from copy import deepcopy
-from multiprocessing import Barrier, Pipe
+from multiprocessing import Pipe
 import logging
 from DeepCrazyhouse.src.domain.agent.player.util.NetPredService import NetPredService
 from DeepCrazyhouse.src.domain.agent.player.util.Node import Node
@@ -19,8 +28,11 @@ from concurrent.futures import ThreadPoolExecutor
 from time import time
 from DeepCrazyhouse.src.domain.agent.player._Agent import _Agent
 from DeepCrazyhouse.src.domain.crazyhouse.GameState import GameState
+import collections
+from DeepCrazyhouse.src.domain.crazyhouse.constants import NB_CHANNELS_FULL, BOARD_WIDTH, BOARD_HEIGHT, NB_LABELS
 
 import cProfile, pstats, io
+DTYPE = np.float
 
 
 def profile(fnc):
@@ -47,22 +59,13 @@ def profile(fnc):
 
 class MCTSAgent(_Agent):
 
-    def __init__(self, net: NeuralNetAPI, threads=16, batch_size=8, playouts_empty_pockets=256,
+    def __init__(self, nets: [NeuralNetAPI], threads=16, batch_size=8, playouts_empty_pockets=256,
                  playouts_filled_pockets=512, cpuct=1, dirichlet_epsilon=.25,
-                 dirichlet_alpha=0.2, max_search_depth=15, temperature=0., clip_quantil=0.,
+                 dirichlet_alpha=0.2, max_search_depth=15, temperature=0., temperature_moves=4,
                  q_value_weight=0., virtual_loss=3, verbose=True, min_movetime=100, check_mate_in_one=False,
-                 enable_timeout=False):
+                 use_pruning=True, use_oscillating_cpuct=True):
         """
         Constructor of the MCTSAgent.
-        The MCTSAgent runs playouts/simulations in the search tree and updates the node statistics.
-        The final move is chosen according to the visit count of each direct child node.
-        One playout is defined as expanding one new node in the tree. In the case of chess this means evaluating a new board position.
-
-        If the evaluation for one move takes too long on your hardware you can decrease the value for:
-         nb_playouts_empty_pockets and nb_playouts_filled_pockets.
-
-        For more details and the mathematical equations please take a look at src/domain/agent/README.md as well as the
-        official DeepMind-papers.
 
         :param net: NeuralNetAPI handle which is used to communicate with the neural network
         :param threads: Number of threads to evaluate the nodes in parallel
@@ -89,6 +92,8 @@ class MCTSAgent(_Agent):
                             If 0. -> Deterministic policy. The move is chosen with the highest probability
                             If 1. -> Pure random sampling policy. The move is sampled from the posterior without any
                                     scaling being applied.
+        :param temperature_moves: Number of fullmoves in which the temperature parameter will be applied.
+                                  Otherwise the temperature will be set to 0 for deterministic play.
         :param clip_quantil: A quantil clipping parameter with range [0., 1.]. All cummulated low percentages for moves
                             are set to 0. This makes sure that very unlikely moves (blunders) are clipped after
                             the exponential scaling.
@@ -106,7 +111,7 @@ class MCTSAgent(_Agent):
                                NetPredService.
         """
 
-        super().__init__(temperature, clip_quantil, verbose)
+        super().__init__(temperature, temperature_moves, verbose)
 
         # the root node contains all references to its child nodes
         self.root_node = None
@@ -118,10 +123,15 @@ class MCTSAgent(_Agent):
         self.node_lookup = {}
 
         # get the network reference
-        self.net = net
+        self.nets = nets
 
         self.virtual_loss = virtual_loss
         self.cpuct_init = cpuct
+
+        if cpuct < 0.01 or cpuct > 10:
+            raise Exception('You might have confused centi-cpuct with cpuct.'
+                            'The requested cpuct is beyond reasonable range: cpuct should be around > 0.01 and < 10.')
+
         self.cpuct = cpuct
         self.max_search_depth = max_search_depth
         self.threads = threads
@@ -146,8 +156,6 @@ class MCTSAgent(_Agent):
             self.my_pipe_endings.append(ending1)
             pip_endings_external.append(ending2)
 
-        self.net_pred_service = NetPredService(pip_endings_external, self.net, batch_size, enable_timeout)
-
         self.nb_playouts_empty_pockets = playouts_empty_pockets
         self.nb_playouts_filled_pockets = playouts_filled_pockets
 
@@ -159,270 +167,347 @@ class MCTSAgent(_Agent):
 
         self.check_mate_in_one = check_mate_in_one
 
-    def evaluate_board_state(self, state_in: GameState):
+        # temporary variables
+        # time counter
+        self.t_start_eval = None
+        # number of nodes before the evaluate_board_state() call are stored here to measure the nps correctly
+        self.total_nodes_pre_search = None
+
+        # allocate shared memory for communicating with the network prediction service
+        self.batch_state_planes = np.zeros((self.threads, NB_CHANNELS_FULL, BOARD_HEIGHT, BOARD_WIDTH), DTYPE)
+        self.batch_value_results = np.zeros(self.threads, DTYPE)
+        self.batch_policy_results = np.zeros((self.threads, NB_LABELS), DTYPE)
+
+        # initialize the NetworkPredictionService and give the pointers to the shared memory
+        self.net_pred_services = []
+        nb_pipes = self.threads // len(nets)
+
+        # create multiple gpu-access points
+        for i, net in enumerate(nets):
+            net_pred_service = NetPredService(pip_endings_external[i*nb_pipes:(i+1)*nb_pipes], net, batch_size, self.batch_state_planes,
+                                                self.batch_value_results, self.batch_policy_results)
+            self.net_pred_services.append(net_pred_service)
+
+        self.transposition_table = collections.Counter()
+        self.send_batches = False
+        self.root_node_prior_policy = None
+
+        self.use_pruning = use_pruning
+        self.use_oscillating_cpuct = use_oscillating_cpuct
+
+    def evaluate_board_state(self, state: GameState):
         """
-        Analyzes the current board state
+        Analyzes the current board state. This is the main method which get called by the uci interface or analysis
+        request.
 
         :param state_in: Actual game state to evaluate for the MCTS
         :return:
         """
 
         # store the time at which the search started
-        t_start_eval = time()
-
-        state = deepcopy(state_in)
+        self.t_start_eval = time()
 
         # check if the net prediction service has already been started
-        if self.net_pred_service.running is False:
+        if self.net_pred_services[0].running is False:
             # start the prediction daemon thread
-            self.net_pred_service.start()
+            for net_pred_service in self.net_pred_services:
+                net_pred_service.start()
 
         # receive a list of all possible legal move in the current board position
-        legal_moves = list(state.get_legal_moves())
-
-        # store what depth has been reached at maximum in the current search tree
-        # default is 1, in case only 1 move is available
-        max_depth_reached = 1
+        legal_moves = state.get_legal_moves()
 
         # consistency check
         if len(legal_moves) == 0:
             raise Exception('The given board state has no legal move available')
 
+        # check first if the the current tree can be reused
+        key = (state.get_transposition_key(), state.get_halfmove_counter)
+
+        if self.use_pruning is False and key in self.node_lookup:
+            self.root_node = self.node_lookup[key]
+            logging.debug('Reuse the search tree. Number of nodes in search tree: %d',
+                          self.root_node.nb_total_expanded_child_nodes)
+            self.total_nodes_pre_search = deepcopy(self.root_node.n_sum)
+
+            # reset potential good nodes for the root
+            self.root_node.q[self.root_node.q < 1.1] = 0
+
+        else:
+            logging.debug("Starting a brand new search tree...")
+            self.root_node = None
+            self.total_nodes_pre_search = 0
+
         # check for fast way out
         if len(legal_moves) == 1:
 
-            # set value 0 as a dummy value
-            value = 0
-            p_vec_small = np.array([1], np.float32)
+            # if there's only a single legal move you only must go 1 depth
+            max_depth_reached = 1
 
-            board_fen = state.get_pythonchess_board().fen()
-
-            # check first if the the current tree can be reused
-            if board_fen in self.node_lookup:
-                self.root_node = self.node_lookup[board_fen]
-                logging.debug('Reuse the search tree. Number of nodes in search tree: %d', self.root_node.n_sum)
-            else:
-                logging.debug("The given board position wasn't found in the search tree.")
-                logging.debug("Starting a brand new search tree...")
-
-                # create a new root node
-                self.root_node = Node(value, p_vec_small, legal_moves, str(state.get_legal_moves()))
-
-                # check a child node if it doesn't exists already
-                if self.root_node.child_nodes[0] is None:
-                    state_child = deepcopy(state_in)
-                    state_child.apply_move(legal_moves[0])
-
-                    # initialize is_leaf by default to false
-                    is_leaf = False
-
-                    # check if the current player has won the game
-                    # (we don't need to check for is_lost() because the game is already over
-                    #  if the current player checkmated his opponent)
-                    if state.is_won() is True:
-                        value = -1
-                        is_leaf = True
-                        legal_moves_child = []
-                        p_vec_small_child = None
-
-                    # check if you can claim a draw - its assumed that the draw is always claimed
-                    elif state.is_draw() is True:
-                        value = 0
-                        is_leaf = True
-                        legal_moves_child = []
-                        p_vec_small_child = None
-
-                    else:
-                        legal_moves_child = list(state_child.get_legal_moves())
-
-                        # start a brand new prediction for the child
-                        state_planes = state_child.get_state_planes()
-                        [value, policy_vec] = self.net.predict_single(state_planes)
-
-                        # extract a sparse policy vector with normalized probabilities
-                        p_vec_small_child = get_probs_of_move_list(policy_vec, legal_moves_child, state_child.is_white_to_move())
-
-                    # create a new child node
-                    child_node = Node(value, p_vec_small_child, legal_moves_child, str(state_child.get_legal_moves()), is_leaf)
-
-                    # connect the child to the root
-                    self.root_node.child_nodes[0] = child_node
-
+            if self.root_node is None:
+                # conduct all necessary steps for fastest way out
+                self._expand_root_node_single_move(state, legal_moves)
         else:
-            board_fen = state.get_board_fen()
 
-            # check first if the the current tree can be reused
-            if board_fen in self.node_lookup:
-                self.root_node = self.node_lookup[board_fen]
-                logging.debug('Reuse the search tree. Number of nodes in search tree: %d', self.root_node.nb_total_expanded_child_nodes)
-            else:
-                logging.debug("The given board position wasn't found in the search tree.")
-                logging.debug("Starting a brand new search tree...")
+            if self.root_node is None:
+                # run a single expansion on the root node
+                self._expand_root_node_multiple_moves(state, legal_moves)
 
-                # initialize is_leaf by default to false
-                is_leaf = False
+            # conduct the mcts-search based on the given settings
+            max_depth_reached = self._run_mcts_search(state)
 
-                # start a brand new tree
-                state_planes = state.get_state_planes()
-                [value, policy_vec] = self.net.predict_single(state_planes)
-
-                # extract a sparse policy vector with normalized probabilities
-                p_vec_small = get_probs_of_move_list(policy_vec, legal_moves, state.is_white_to_move())
-
-                # create a new root node
-                self.root_node = Node(value, p_vec_small, legal_moves, str(state.get_legal_moves()), is_leaf)
-
-            # clear the look up table
-            self.node_lookup = {}
-
-            # apply dirichlet noise to the prior probabilities in order to ensure
-            #  that every move can possibly be visited
-            self.root_node.apply_dirichlet_noise_to_prior_policy(epsilon=self.dirichlet_epsilon, alpha=self.dirichlet_alpha)
-
-            futures = []
-
-            # set the number of playouts accordingly
-            if state_in.are_pocket_empty() is True:
-                nb_playouts = self.nb_playouts_empty_pockets
-            else:
-                nb_playouts = self.nb_playouts_filled_pockets
-
-            t_elapsed = 0
-            cur_playouts = 0
-            old_time = time()
-
-            while max_depth_reached < self.max_search_depth and\
-                       cur_playouts < nb_playouts and\
-                     t_elapsed*1000 < self.movetime_ms: #and np.abs(self.root_node.q.mean()) < 0.99:
-
-                # start searching
-                with ThreadPoolExecutor(max_workers=self.threads) as executor:
-                    for i in range(self.threads):
-                        # calculate the thread id based on the current playout
-                        futures.append(executor.submit(self._run_single_playout, state=deepcopy(state),
-                                                       parent_node=self.root_node, depth=1, mv_list=[]))
-
-                cur_playouts += self.threads
-                time_show_info = time() - old_time
-
-                # store the mean of all value predictions in this variable
-                #mean_value = 0
-
-                for i, f in enumerate(futures):
-                    cur_value, cur_depth, mv_list = f.result()
-
-                    # sum up all values
-                    #mean_value += cur_value
-
-                    if cur_depth > max_depth_reached:
-                        max_depth_reached = cur_depth
-
-                    # Print every second if verbose is true
-                    #if self.verbose and time_show_info > 1:
-                    #    str_moves = self._mv_list_to_str(mv_list)
-                    #    logging.debug('Update: %d' % cur_depth)
-                    #    print('info score cp %d depth %d nodes %d pv%s' % (
-                    #        value_to_centipawn(cur_value), cur_depth, self.root_node.n_sum, str_moves))
-                    #    old_time = time()
-
-                # Print every second if verbose is true
-                if self.verbose and time_show_info > 1:
-                    # select the q-value according to the mcts best child value
-                    best_child_idx = self.root_node.get_mcts_policy(self.q_value_weight).argmax()
-                    cur_value = self.root_node.q[best_child_idx]
-
-                    lst_best_moves, _ = self.get_calculated_line()
-                    str_moves = self._mv_list_to_str(lst_best_moves)
-                    print('info score cp %d depth %d nodes %d pv%s' % (
-                        value_to_centipawn(cur_value), len(lst_best_moves), self.root_node.n_sum, str_moves))
-                    old_time = time()
-
-                # update the current search time
-                t_elapsed = time() - t_start_eval
-                if self.verbose and time_show_info > 1:
-                    print('info nps %d time %d' % ((self.root_node.n_sum / t_elapsed), t_elapsed * 1000))
-
-            # receive the policy vector based on the MCTS search
-            p_vec_small = self.root_node.get_mcts_policy(self.q_value_weight)
+            t_elapsed = time() - self.t_start_eval
             print('info string move overhead is %dms' % (t_elapsed*1000 - self.movetime_ms))
 
-        # store the current root in the lookup table
-        self.node_lookup[state.get_board_fen()] = self.root_node
+        # receive the policy vector based on the MCTS search
+        p_vec_small = self.root_node.get_mcts_policy(self.q_value_weight)
 
-        # select the q value which would score the highest value
-
-        #value = self.root_node.q.max()
+        if self.use_pruning is False:
+            # store the current root in the lookup table
+            self.node_lookup[key] = self.root_node
 
         # select the q-value according to the mcts best child value
-        best_child_idx = self.root_node.get_mcts_policy(self.q_value_weight).argmax()
+        best_child_idx = p_vec_small.argmax()
         value = self.root_node.q[best_child_idx]
 
         lst_best_moves, _ = self.get_calculated_line()
         str_moves = self._mv_list_to_str(lst_best_moves)
 
         # show the best calculated line
-        time_e = time() - t_start_eval
-        node_searched = self.root_node.n_sum
-        print('info score cp %d depth %d nodes %d time %d nps %d pv%s' % (
-            value_to_centipawn(value), max_depth_reached, node_searched, time_e*1000, node_searched/max(1, time_e), str_moves))
+        node_searched = int(self.root_node.n_sum - self.total_nodes_pre_search)
+        # In uci the depth is given using half-moves notation also called plies
+        time_e = time() - self.t_start_eval
 
         if len(legal_moves) != len(p_vec_small):
-            raise  Exception('Legal move list %s with length %s is uncompatible to policy vector %s with shape %s for board state %s' % (legal_moves, len(legal_moves), p_vec_small, p_vec_small.shape, state_in))
-            self.node_lookup = {}
-            # restart the search TODO: Fix this error
-            """
-                raise Exception('Legal move list %s with length %s is uncompatible to policy vector %s with shape %s for board state %s' % (legal_moves, len(legal_moves), p_vec_small, p_vec_small.shape, state_in))
-                    Exception: Legal move list [Move.from_uci('e4h7'), Move.from_uci('e4g6'), Move.from_uci('e4f5'), Move.from_uci('c4a6'), Move.from_uci('c4b5'), Move.from_uci('c4b3'), Move.from_uci('f3g5'), Move.from_uci('f3e5'), Move.from_uci('f3h4'), Move.from_uci('f3d4'), Move.from_uci('f3d2'), Move.from_uci('f3e1'), Move.from_uci('g1h1'), Move.from_uci('f1e1'), Move.from_uci('d1e2'), Move.from_uci('d1d2'), Move.from_uci('d1e1'), Move.from_uci('d1c1'), Move.from_uci('d1b1'), Move.from_uci('a1c1'), Move.from_uci('a1b1'), Move.from_uci('d3d4'), Move.from_uci('h2h3'), Move.from_uci('g2g3'), Move.from_uci('c2c3'), Move.from_uci('b2b3'), Move.from_uci('a2a3'), Move.from_uci('h2h4'), Move.from_uci('b2b4'), Move.from_uci('a2a4'), Move.from_uci('N@b1'), Move.from_uci('N@c1'), Move.from_uci('N@e1'), Move.from_uci('N@h1'), Move.from_uci('N@d2'), Move.from_uci('N@e2'), Move.from_uci('N@a3'), Move.from_uci('N@b3'), Move.from_uci('N@c3'), Move.from_uci('N@e3'), Move.from_uci('N@g3'), Move.from_uci('N@h3'), Move.from_uci('N@a4'), Move.from_uci('N@b4'), Move.from_uci('N@d4'), Move.from_uci('N@f4'), Move.from_uci('N@h4'), Move.from_uci('N@b5'), Move.from_uci('N@f5'), Move.from_uci('N@g5'), Move.from_uci('N@h5'), Move.from_uci('N@a6'), Move.from_uci('N@b6'), Move.from_uci('N@c6'), Move.from_uci('N@e6'), Move.from_uci('N@g6'), Move.from_uci('N@d7'), Move.from_uci('N@e7'), Move.from_uci('N@h7'), Move.from_uci('N@b8'), Move.from_uci('N@c8'), Move.from_uci('N@d8'), Move.from_uci('N@e8'), Move.from_uci('N@h8')] with length 64 is uncompatible to policy vector [0.71529347 0.00194482 0.00194482 0.00389555 0.00194482 0.00194482
-                     0.00389942 0.00389942 0.00389941 0.0038994  0.0019448  0.0038994
-                     0.0019448  0.00389941 0.00389941 0.00194482 0.00585401 0.00194482
-                     0.00194482 0.00389941 0.00389942 0.00194482 0.00194482 0.00389942
-                     0.00389942 0.00389941 0.00585341 0.00194482 0.00585396 0.00389942
-                     0.00389941 0.00389941 0.00389941 0.00389941 0.00194482 0.00585401
-                     0.00585401 0.00194482 0.00585399 0.00780859 0.00389942 0.00389941
-                     0.00585401 0.00976319 0.00780829 0.00585215 0.00389942 0.00389942
-                     0.00194482 0.00194482 0.02735228 0.00389942 0.005854   0.00389939
-                     0.00389924 0.00389942 0.00194482 0.00389942 0.00585398 0.00389942
-                     0.0038994  0.0038994  0.00585398 0.00194482 0.00389942 0.00389942
-                     0.00389942 0.00389942] with shape (68,) for board state r4rk1/ppp2pp1/3p1q1p/n1bPp3/2B1B1b1/3P1N2/PPP2PPP/R2Q1RK1[Nn] w - - 2 13
-             """
-            #return self.evaluate_board_state(state_in)
+            raise Exception('Legal move list %s with length %s is uncompatible to policy vector %s'
+                             ' with shape %s for board state %s and nodes legal move list: %s' %
+                             (legal_moves, len(legal_moves),
+                                p_vec_small, p_vec_small.shape, state,
+                                self.root_node.legal_moves))
 
-        return value, legal_moves, p_vec_small
+        # define the remaining return variables
+        cp = value_to_centipawn(value)
+        depth = max_depth_reached
+        nodes = node_searched
+        time_elapsed_s = time_e*1000
+        nps = node_searched/time_e
+        pv = str_moves
 
-    def perform_action(self, state: GameState, verbose=True):
+        return value, legal_moves, p_vec_small, cp, depth, nodes, time_elapsed_s, nps, pv
 
-        value, selected_move, confidence, selected_child_idx = super().perform_action(state)
-
-        # apply the selected mve on the current board state in order to create a lookup table for future board states
-        state.apply_move(selected_move)
-
-        # select the q value for the child which leads to the best calculated line
-        value = self.root_node.q[selected_child_idx]
-
-        # select the next node
-        node = self.root_node.child_nodes[selected_child_idx]
-
-        # store the reference links for all possible child future child to the node lookup table
-        for idx, mv in enumerate(state.get_legal_moves()):
-            state_future = deepcopy(state)
-            state_future.apply_move(mv)
-
-            # store the current child node with it's board fen as the hash-key if the child node has already been expanded
-            if node is not None and idx < node.nb_direct_child_nodes and node.child_nodes[idx] is not None:
-                self.node_lookup[state_future.get_board_fen()] = node.child_nodes[idx]
-
-        return value, selected_move, confidence, selected_child_idx
-
-    #@profile
-    def _run_single_playout(self, state: GameState, parent_node: Node, depth=1, mv_list=[]): #, pipe_id):
+    def _expand_root_node_multiple_moves(self, state, legal_moves):
         """
-        This function works recursively until a terminal node is reached
+        Checks if the current root node can be found in the look-up table.
+        Otherwise run a single inference of the neural network for this board state
 
-        :param state: Current game-state for the evaluation. This state differs between the treads
+        :param state: Current game state
+        :param legal_moves: Available moves
+        :return:
+        """
+
+        # initialize is_leaf by default to false
+        is_leaf = False
+
+        # start a brand new tree
+        state_planes = state.get_state_planes()
+        [value, policy_vec] = self.nets[0].predict_single(state_planes)
+
+        # extract a sparse policy vector with normalized probabilities
+        p_vec_small = get_probs_of_move_list(policy_vec, legal_moves, state.is_white_to_move())
+
+        if self.check_mate_in_one is True:
+            str_legal_moves = str(state.get_legal_moves())
+        else:
+            str_legal_moves = ''
+
+        # create a new root node
+        self.root_node = Node(value, p_vec_small, legal_moves, str_legal_moves, is_leaf, clip_low_visit=False)
+
+    def _expand_root_node_single_move(self, state, legal_moves):
+        """
+        Expands the current root in the case if there's only a single move available.
+        The neural network search can be omitted in this case.
+
+        :param state: Request games state
+        :param legal_moves: Available moves
+        :return:
+        """
+
+        # set value 0 as a dummy value
+        value = 0
+        p_vec_small = np.array([1], np.float32)
+
+        # create a new root node
+        self.root_node = Node(value, p_vec_small, legal_moves, str(state.get_legal_moves()))
+
+        # check a child node if it doesn't exists already
+        if self.root_node.child_nodes[0] is None:
+            state_child = deepcopy(state)
+            state_child.apply_move(legal_moves[0])
+
+            # initialize is_leaf by default to false
+            is_leaf = False
+
+            # check if the current player has won the game
+            # (we don't need to check for is_lost() because the game is already over
+            #  if the current player checkmated his opponent)
+            if state.is_won() is True:
+                value = -1
+                is_leaf = True
+                legal_moves_child = []
+                p_vec_small_child = None
+
+            # check if you can claim a draw - its assumed that the draw is always claimed
+            elif self.can_claim_threefold_repetition(state.get_transposition_key(), [0]) or\
+                    state.get_pythonchess_board().can_claim_fifty_moves() is True:
+                value = 0
+                is_leaf = True
+                legal_moves_child = []
+                p_vec_small_child = None
+
+            else:
+                legal_moves_child = state_child.get_legal_moves()
+
+                # start a brand new prediction for the child
+                state_planes = state_child.get_state_planes()
+                [value, policy_vec] = self.nets[0].predict_single(state_planes)
+
+                # extract a sparse policy vector with normalized probabilities
+                p_vec_small_child = get_probs_of_move_list(policy_vec, legal_moves_child,
+                                                           state_child.is_white_to_move())
+
+            # create a new child node
+            child_node = Node(value, p_vec_small_child, legal_moves_child, str(state_child.get_legal_moves()),
+                              is_leaf)
+
+            # connect the child to the root
+            self.root_node.child_nodes[0] = child_node
+
+    def _run_mcts_search(self, state):
+        """
+        Runs a new or continues the mcts on the current search tree.
+
+        :param state: Input state given by the user
+        :return: max_depth_reached (int) - The longest search path length after the whole search
+        """
+
+        # clear the look up table
+        self.node_lookup = {}
+
+        # safe the prior policy of the root node
+        self.root_node_prior_policy = deepcopy(self.root_node.p)
+
+        # apply dirichlet noise to the prior probabilities in order to ensure
+        #  that every move can possibly be visited
+        self.root_node.apply_dirichlet_noise_to_prior_policy(epsilon=self.dirichlet_epsilon,
+                                                             alpha=self.dirichlet_alpha)
+
+        # iterate through all children and add dirichlet if there exists any
+        for child_node in self.root_node.child_nodes:
+            if child_node is not None:
+                # test of adding dirichlet noise to a new node
+                child_node.apply_dirichlet_noise_to_prior_policy(epsilon=self.dirichlet_epsilon * .1,
+                                                               alpha=self.dirichlet_alpha)
+
+        # store what depth has been reached at maximum in the current search tree
+        # default is 1, in case only 1 move is available
+        max_depth_reached = 1
+
+        futures = []
+
+        # set the number of playouts accordingly
+        if state.are_pocket_empty() is True:
+            nb_playouts = self.nb_playouts_empty_pockets
+        else:
+            nb_playouts = self.nb_playouts_filled_pockets
+            self.temperature_current = 0
+
+        t_elapsed = 0
+        cur_playouts = 0
+        old_time = time()
+
+        cpuct_init = self.cpuct
+
+        decline = True
+
+        while max_depth_reached < self.max_search_depth and \
+                cur_playouts < nb_playouts and \
+                t_elapsed * 1000 < self.movetime_ms:  # and np.abs(self.root_node.q.mean()) < 0.99:
+
+            if self.use_oscillating_cpuct is True:
+                # Test about decreasing CPUCT value
+                if decline is True:
+                    self.cpuct -= 0.01
+                else:
+                    self.cpuct += 0.01
+                if self.cpuct < cpuct_init * .5:
+                    decline = False
+                elif self.cpuct > cpuct_init:
+                    decline = True
+
+            # start searching
+            with ThreadPoolExecutor(max_workers=self.threads) as executor:
+                for i in range(self.threads):
+                    # calculate the thread id based on the current playout
+                    futures.append(executor.submit(self._run_single_playout, state=state,
+                                                   parent_node=self.root_node, pipe_id=i, depth=1, chosen_nodes=[]))
+
+            cur_playouts += self.threads
+            time_show_info = time() - old_time
+
+            for i, f in enumerate(futures):
+                cur_value, cur_depth, chosen_nodes = f.result()
+
+                if cur_depth > max_depth_reached:
+                    max_depth_reached = cur_depth
+
+                # Print the explored line of the last line for every x seconds if verbose is true
+                if self.verbose and time_show_info > 0.5 and i == len(futures) - 1:
+                    mv_list = self._create_mv_list(chosen_nodes)
+                    str_moves = self._mv_list_to_str(mv_list)
+                    print('info score cp %d depth %d nodes %d pv%s' % (
+                        value_to_centipawn(cur_value), cur_depth, self.root_node.n_sum, str_moves))
+                    logging.debug('Update info')
+                    old_time = time()
+
+            # update the current search time
+            t_elapsed = time() - self.t_start_eval
+            if self.verbose and time_show_info > 1:
+                node_searched = int(self.root_node.n_sum - self.total_nodes_pre_search)
+                print('info nps %d time %d' % (int((node_searched / t_elapsed)), t_elapsed * 1000))
+
+        self.cpuct = cpuct_init
+
+        return max_depth_reached
+
+    def perform_action(self, state_in: GameState, verbose=True):
+        """
+        Return a value, best move with according to the mcts search.
+        This method is used when using the mcts agent as a player.
+
+        :param state: Requested games state
+        :param verbose: Boolean if debug messages shall be shown
+        :return: value - Board value prediction
+                selected_move - Python chess move object according to mcts
+                confidence - Confidence for selecting this move
+                selected_child_idx - Child index which correspond to the selected child
+        """
+
+        # create a deepcopy of the state in order not to change the given input parameter
+        state = deepcopy(state_in)
+
+        return super().perform_action(state)
+
+    def _run_single_playout(self, state: GameState, parent_node: Node, pipe_id=0, depth=1, chosen_nodes=[]):
+        """
+        This function works recursively until a leaf or terminal node is reached.
+        It ends by backpropagating the value of the new expanded node or by propagating the value of a terminal state.
+
+        :param state_: Current game-state for the evaluation. This state differs between the treads
         :param parent_node: Current parent-node of the selected node. In the first  expansion this is the root node.
         :param depth: Current depth for the evaluation. Depth is increased by 1 for every recusive call
-        :param mv_list: List of moves which have been taken in the current path. For each selected child node this list
+        :param chosen_nodes: List of moves which have been taken in the current path. For each selected child node this list
                         is expanded by one move recursively.
+        :param chosen_nodes: List of all nodes that this thread has explored with respect to the root node
         :return: -value: The inverse value prediction of the current board state. The flipping by -1 each turn is needed
                         because the point of view changes each half-move
                 depth: Current depth reach by this evaluation
@@ -440,120 +525,153 @@ class MCTSAgent(_Agent):
         # the effect of virtual loss will be undone if the playout is over
         parent_node.apply_virtual_loss_to_child(child_idx, self.virtual_loss)
 
+        if depth == 1:
+            state = GameState(deepcopy(state.get_pythonchess_board()))
+
         # apply the selected move on the board
         state.apply_move(move)
 
         # append the selected move to the move list
-        mv_list.append(move)
+        # append the chosen child idx to the chosen_nodes list
+        chosen_nodes.append(child_idx)
 
         if node is None:
 
-            # get the board-fen which is used as an identifier for the board positions in the look-up table
-            board_fen = state.get_board_fen()
+            # get the transposition-key which is used as an identifier for the board positions in the look-up table
+            transposition_key = state.get_transposition_key()
 
             # check if the addressed fen exist in the look-up table
-            if board_fen in self.node_lookup:
-                # get the node from the look-up list
-                node = self.node_lookup[board_fen]
+            # note: It's important to use also the halfmove-counter here, otherwise the system can create an infinite
+            # feed-back-loop
+            key = (transposition_key, state.get_halfmove_counter())
 
-                with parent_node.lock:
-                    # setup a new connection from the parent to the child
-                    parent_node.child_nodes[child_idx] = node
+            # expand and evaluate the new board state (the node wasn't found in the look-up table)
+            # its value will be backpropagated through the tree and flipped after every layer
+            # receive a free available pipe
+            my_pipe = self.my_pipe_endings[pipe_id]
 
-                # get the prior value from the leaf node which has already been expanded
-                #value = node.v
-
-                # get the value from the leaf node (the current function is called recursively)
-                value, depth, mv_list = self._run_single_playout(state, node, depth+1, mv_list)
-
-            else:
-                # expand and evaluate the new board state (the node wasn't found in the look-up table)
-                # its value will be backpropagated through the tree and flipped after every layer
-
-                # receive a free available pipe
-                my_pipe = self.my_pipe_endings.pop()
+            if self.send_batches is True:
                 my_pipe.send(state.get_state_planes())
                 # this pipe waits for the predictions of the network inference service
                 [value, policy_vec] = my_pipe.recv()
-                # put the used pipe back into the list
-                self.my_pipe_endings.append(my_pipe)
+            else:
+                state_planes = state.get_state_planes()
+                self.batch_state_planes[pipe_id] = state_planes
 
-                # initialize is_leaf by default to false
-                is_leaf = False
+                my_pipe.send(pipe_id)
 
-                # check if the current player has won the game
-                # (we don't need to check for is_lost() because the game is already over
-                #  if the current player checkmated his opponent)
+                result_channel = my_pipe.recv()
+
+                value = np.array(self.batch_value_results[result_channel])
+                policy_vec = np.array(self.batch_policy_results[result_channel])
+
+            # initialize is_leaf by default to false
+            is_leaf = False
+
+
+            # check if the current player has won the game
+            # (we don't need to check for is_lost() because the game is already over
+            #  if the current player checkmated his opponent)
+            is_won = False
+            is_check = False
+
+            if state.is_check() is True:
+                is_check = True
                 if state.is_won() is True:
+                    is_won = True
+
+            if is_won is True:
                     value = -1
                     is_leaf = True
                     legal_moves = []
                     p_vec_small = None
+                    # establish a mate in one connection in order to stop exploring different alternatives
+                    parent_node.mate_child_idx = child_idx
 
-                # check if you can claim a draw - its assumed that the draw is always claimed
-                elif state.is_draw() is True:
-                    value = 0
-                    is_leaf = True
-                    legal_moves = []
-                    p_vec_small = None
-                else:
-                    # get the current legal move of its board state
-                    legal_moves = list(state.get_legal_moves())
-                    if len(legal_moves) < 1:
-                        raise Exception('No legal move is available for state: %s' % state)
+            # get the value from the leaf node (the current function is called recursively)
+            # check if you can claim a draw - its assumed that the draw is always claimed
+            elif self.can_claim_threefold_repetition(transposition_key, chosen_nodes) or \
+                    state.get_pythonchess_board().can_claim_fifty_moves() is True:
+                value = 0
+                is_leaf = True
+                legal_moves = []
+                p_vec_small = None
+            else:
+                # get the current legal move of its board state
+                legal_moves = state.get_legal_moves()
 
-                    # extract a sparse policy vector with normalized probabilities
-                    try:
-                        p_vec_small = get_probs_of_move_list(policy_vec, legal_moves,
-                                                             is_white_to_move=state.is_white_to_move(), normalize=True)
+                if len(legal_moves) < 1:
+                    raise Exception('No legal move is available for state: %s' % state)
 
-                    except KeyError:
-                        raise Exception('Key Error for state: %s' % state)
+                # extract a sparse policy vector with normalized probabilities
+                try:
+                    p_vec_small = get_probs_of_move_list(policy_vec, legal_moves,
+                                                         is_white_to_move=state.is_white_to_move(), normalize=True)
 
-                # convert all legal moves to a string if the option check_mate_in_one was enabled
-                if self.check_mate_in_one is True:
-                    str_legal_moves = str(state.get_legal_moves())
-                else:
-                    str_legal_moves = ''
+                except KeyError:
+                    raise Exception('Key Error for state: %s' % state)
 
-                # create a new node
-                new_node = Node(value, p_vec_small, legal_moves, str_legal_moves, is_leaf)
+            # convert all legal moves to a string if the option check_mate_in_one was enabled
+            if self.check_mate_in_one is True:
+                str_legal_moves = str(state.get_legal_moves())
+            else:
+                str_legal_moves = ''
 
-                #if is_leaf is False:
-                # test of adding dirichlet noise to a new node
-                #    new_node.apply_dirichlet_noise_to_prior_policy(epsilon=self.dirichlet_epsilon/4, alpha=self.dirichlet_alpha)
+            # clip the visit nodes for all nodes in the search tree except the director opp. move
+            clip_low_visit = self.use_pruning and depth != 1
 
+            # create a new node
+            new_node = Node(value, p_vec_small, legal_moves, str_legal_moves, is_leaf, transposition_key, clip_low_visit)
+
+            if depth == 1:
+
+                # disable uncertain moves from being visited by giving them a very bad score
+                if is_leaf is False:
+                    if self.root_node_prior_policy[child_idx] < 1e-3 and value*-1 < self.root_node.v:
+                        with parent_node.lock:
+                            value = 99
+
+                if value < 0:  # and state.are_pocket_empty(): #and pipe_id == 0:
+                    # test of adding dirichlet noise to a new node
+                    new_node.apply_dirichlet_noise_to_prior_policy(epsilon=self.dirichlet_epsilon*.02,
+                                                                   alpha=self.dirichlet_alpha)
+
+            if self.use_pruning is False:
                 # include a reference to the new node in the look-up table
-                self.node_lookup[board_fen] = new_node
+                self.node_lookup[key] = new_node
 
-                with parent_node.lock:
-                    # add the new node to its parent
-                    parent_node.child_nodes[child_idx] = new_node
-
-                # check if the new node has a mate_in_one connection (if yes overwrite the network prediction)
-                if new_node.mate_child_idx is not None:
-                    value = 1
+            with parent_node.lock:
+                # add the new node to its parent
+                parent_node.child_nodes[child_idx] = new_node
 
         # check if we have reached a leaf node
         elif node.is_leaf is True:
             value = node.v
-            # receive a free available pipe
-            my_pipe = self.my_pipe_endings.pop()
-            my_pipe.send(state.get_state_planes())
-            # this pipe waits for the predictions of the network inference service
-            [_, _] = my_pipe.recv()
-            # put the used pipe back into the list
-            self.my_pipe_endings.append(my_pipe)
 
         else:
             # get the value from the leaf node (the current function is called recursively)
-            value, depth, mv_list = self._run_single_playout(state, node, depth+1, mv_list)
+            value, depth, chosen_nodes = self._run_single_playout(state, node, pipe_id, depth + 1, chosen_nodes)
 
         # revert the virtual loss and apply the predicted value by the network to the node
         parent_node.revert_virtual_loss_and_update(child_idx, self.virtual_loss, -value)
 
         # we invert the value prediction for the parent of the above node layer because the player's turn is flipped every turn
-        return -value, depth, mv_list
+        return -value, depth, chosen_nodes
+
+    def can_claim_threefold_repetition(self, transposition_key, chosen_nodes):
+
+        search_occurrence_counter = 0
+
+        node = self.root_node.child_nodes[chosen_nodes[0]]
+
+        for node_idx in chosen_nodes[1:-1]:
+            if node.transposition_key == transposition_key:
+                search_occurrence_counter += 1
+            node = node.child_nodes[node_idx]
+            if node is None:
+                break
+
+        return self.transposition_table[transposition_key] + search_occurrence_counter >= 2
 
     def _select_node(self, parent_node: Node):
         """
@@ -583,13 +701,14 @@ class MCTSAgent(_Agent):
 
         return node, move, child_idx
 
-    def _select_node_based_on_mcts_policy(self, parent_node: Node):
+    def _select_node_based_on_mcts_policy(self, parent_node: Node, clip_bad_visit_nodes=False):
         """
         Selects the next node based on the mcts policy which is used to predict the final best move.
 
         :param parent_node: Node from which to select the next child.
         :return:
         """
+
         child_idx = parent_node.get_mcts_policy(self.q_value_weight).argmax()
 
         nb_visits = parent_node.n[child_idx]
@@ -624,7 +743,8 @@ class MCTSAgent(_Agent):
 
         while node is not None and node.is_leaf is False:
             # go deep through the tree by always selecting the best move for both players
-            node, move, nb_visits = self._select_node_based_on_mcts_policy(node)
+            clip_bad_visit_nodes = node == self.root_node  # and mv_number > 1
+            node, move, nb_visits = self._select_node_based_on_mcts_policy(node, clip_bad_visit_nodes=clip_bad_visit_nodes)
             lst_best_moves.append(move)
             lst_nb_visits.append(nb_visits)
         return lst_best_moves, lst_nb_visits
@@ -635,10 +755,28 @@ class MCTSAgent(_Agent):
         :param lst_moves: List chess.Moves objects
         :return: String representing each move in the list
         """
-        str_moves = ""
-        for mv in lst_moves:
+        str_moves = lst_moves[0].uci()
+
+        for mv in lst_moves[1:]:
             str_moves += " " + mv.uci()
+
         return str_moves
+
+    def _create_mv_list(self, lst_chosen_nodes: [int]):
+        """
+        Creates a movement list given the child node indices from the root node onwards.
+        :param lst_chosen_nodes: List of chosen nodes
+        :return: mv_list - List of python chess moves
+        """
+        #str_moves = ""
+        mv_list = []
+        node = self.root_node #.child_nodes[lst_chosen_nodes[0]]
+
+        for child_idx in lst_chosen_nodes:
+            mv = node.legal_moves[child_idx]
+            node = node.child_nodes[child_idx]
+            mv_list.append(mv)
+        return mv_list
 
     def update_movetime(self, time_ms_per_move):
         """
